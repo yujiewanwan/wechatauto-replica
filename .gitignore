@@ -27,3 +27,13 @@ COMMIT_MSG.txt
 
 # sibling repo
 WeChatBot-new/
+
+# Personal scratch data exports (may contain private chat records / API keys)
+*.json
+
+# sync runtime state
+_sync_*.lock
+logs/
+
+# local config (contains token)
+.env
