@@ -17,8 +17,9 @@ SEQ = 1700000000000
 
 def post(payload):
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    status, data = S._retry("POST", S.SYNC_BASE + "/v1/messages", body,
-                            {"Content-Type": "application/json"})
+    headers = S.sync_auth_headers()
+    headers["Content-Type"] = "application/json"
+    status, data = S._retry("POST", S.SYNC_BASE + "/messages", body, headers)
     text = data.decode("utf-8", "replace")
     try:
         return status, json.loads(text)
@@ -36,7 +37,8 @@ def msg(local_id, sender_username, media_url=None):
     }
 
 
-status, health = S._retry("GET", S.SYNC_BASE + "/v1/health", attempts=2)
+status, health = S._retry("GET", S.SYNC_BASE + "/health", None,
+                          S.sync_auth_headers(), attempts=2)
 print("health:", status, health.decode()[:80])
 
 print("\n[1+2] 同 sort_seq、不同 local_id，带 sender_username")
