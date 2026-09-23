@@ -1671,15 +1671,37 @@ class WeChatDB:
         self._sender_id_cache = idx
         return idx
 
-    def _resolve_sender(self, sender_id, sender_index, nicks, self_nick) -> str:
+    @staticmethod
+    def _lookup_sender_id(sender_index, sender_id):
+        """在 {rowid: user_name} 里查发送者；sender_id 可能是 int 也可能是 str。"""
+        if not isinstance(sender_index, dict):
+            return None
+        if isinstance(sender_id, int) or (isinstance(sender_id, str)
+                                          and sender_id.lstrip("-").isdigit()):
+            return sender_index.get(int(sender_id))
+        return sender_index.get(sender_id)
+
+    def _resolve_sender(self, sender_id, sender_index, nicks, self_nick,
+                        chat=None, self_username=None) -> str:
+        """real_sender_id → 显示名。
+
+        sender_id 是**该消息分片** Name2Id 表的 rowid（rowid → user_name），只能靠
+        同一分片的映射换成 wxid。数字本身没有意义：不同分片里同一个数字常常是不同的人。
+        映射查不到时按会话退：个聊里非自己的一方必然是对端，直接用会话名（比数字有用，
+        而且这个编号会随微信库重写漂移，同一个人前后可能是两个号）；群聊只能留原始数字。
+        """
+        u = self._lookup_sender_id(sender_index, sender_id)
+        if u:
+            if self_username and u == self_username:
+                return self_nick
+            return nicks.get(u, u)
         if sender_id in (2, "2"):
             return self_nick
-        if isinstance(sender_id, int):
-            u = sender_index.get(sender_id)
-            if u:
-                return nicks.get(u, u)
-        u = str(sender_id)
-        return nicks.get(u, u)
+        if chat and not str(chat).endswith("@chatroom"):
+            name = nicks.get(chat)
+            if name:
+                return name
+        return str(sender_id)
 
     @staticmethod
     def _msg_type_name(t: int):

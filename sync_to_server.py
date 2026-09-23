@@ -633,20 +633,41 @@ MSG_SELECT = ("SELECT local_id, local_type, server_id, real_sender_id, create_ti
               "message_content, packed_info_data, sort_seq FROM %s")
 
 
+def _name2id_index(conn):
+    """分片库的 Name2Id(rowid → user_name)。real_sender_id 就是这张表的 rowid。
+
+    必须在分片内解析：这是个**按分片的 id 空间**，同一个数字在 message_0.db 和
+    message_1.db 里通常是不同的人（实测 shard0 的 5 是 zhaojuan7390，
+    shard1 的 5 是 wxid_2sbtuurztov522），合成一张全局表会张冠李戴。
+    """
+    idx = {}
+    try:
+        for rid, name in conn.execute("SELECT rowid, user_name FROM Name2Id"):
+            if name:
+                idx[int(rid)] = name
+    except sqlite3.DatabaseError:
+        pass
+    return idx
+
+
 def _sender_username(sid, chat, senders, account):
     """发送者 wxid：可 join contacts.username。sender_id 是本机数字 id，跨机无意义。
 
-    自己 → account；群聊查 SenderName2Id；单聊非自己的一方必然是对端，由 chat 推出。
+    自己 → account；其余查该分片的 Name2Id；单聊非自己的一方必然是对端，由 chat 推出。
     """
+    u = _lookup_sender(senders, sid)
+    if u:
+        return u
     if sid in (2, "2"):
         return account
-    if isinstance(sid, int):
-        u = senders.get(sid)
-        if u:
-            return u
     if not chat.endswith("@chatroom"):
         return chat
     return ""
+
+
+def _lookup_sender(senders, sid):
+    """在 {rowid: user_name} 里查发送者；sender_id 可能是 int 或 str。"""
+    return WeChatDB._lookup_sender_id(senders, sid)
 
 
 def scan_messages(db, watermark=None):
@@ -658,7 +679,6 @@ def scan_messages(db, watermark=None):
     """
     idx = db._build_md5_index()
     nicks = db._nickname_index()
-    senders = db._sender_id_index()
     account = db.wxid
     self_nick = db.get_self_info().get("nick_name", "我")
 
@@ -666,6 +686,7 @@ def scan_messages(db, watermark=None):
     for rel in db._message_dbs():
         conn = db._open(rel)
         try:
+            n2i = _name2id_index(conn)     # 该分片的 rowid → user_name
             tabs = [t[0] for t in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' "
                 "AND name LIKE 'Msg_%'")]
@@ -681,7 +702,8 @@ def scan_messages(db, watermark=None):
                         rows = conn.execute(MSG_SELECT % t).fetchall()
                 except sqlite3.DatabaseError:
                     continue
-                raw.setdefault(chat, []).extend(rows)
+                # 记下每行的来源分片映射：id 是分片内的，过后合并就分不清了
+                raw.setdefault(chat, []).extend((r, n2i) for r in rows)
         finally:
             conn.close()
 
@@ -689,9 +711,9 @@ def scan_messages(db, watermark=None):
     for chat, rows in raw.items():
         if len(chat) == 32 and re.fullmatch(r"[0-9a-f]{32}", chat):
             unresolved += 1          # contact/session 里已无此会话，只剩表名 md5
-        rows.sort(key=lambda r: (_nn(r["sort_seq"]), _nn(r["local_id"])))
+        rows.sort(key=lambda x: (_nn(x[0]["sort_seq"]), _nn(x[0]["local_id"])))
         seen, msgs = set(), []
-        for r in rows:
+        for r, n2i in rows:
             seq = _nn(r["sort_seq"])
             # 去重键必须与服务端唯一键一致：(chat, sort_seq, local_id)。
             # sort_seq 是秒级时间戳，同秒多条消息必然撞号，只按它去重会真丢数据。
@@ -710,7 +732,8 @@ def scan_messages(db, watermark=None):
                 "type_code": _int32(e["type_code"]),
                 "sender_id": _s(e["sender_id"], 64),
                 "sender_name": _s(db._resolve_sender(
-                    r["real_sender_id"], senders, nicks, self_nick), 255),
+                    r["real_sender_id"], n2i, nicks, self_nick, chat,
+                    self_username=account), 255),
                 "create_time": _nn(e["create_time"]),
                 "content": _text(e["content"], 16777215),
                 "server_id": _opt_int(e["server_id"]),
@@ -719,7 +742,7 @@ def scan_messages(db, watermark=None):
             }
             if SEND_SENDER_USERNAME:
                 item["sender_username"] = _s(_sender_username(
-                    r["real_sender_id"], chat, senders, account), 255)
+                    r["real_sender_id"], chat, n2i, account), 255)
             msgs.append(item)
         if msgs:
             out[chat] = msgs
