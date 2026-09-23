@@ -670,6 +670,28 @@ def _lookup_sender(senders, sid):
     return WeChatDB._lookup_sender_id(senders, sid)
 
 
+def _sender_name(db, row, n2i, nicks, self_nick, chat, account, exported):
+    """发送者显示名。
+
+    sender_name 在服务端是可更新的派生字段，所以原则是「要么给更好的值，要么什么都不给」：
+
+    - 该分片的 Name2Id 没读到（多半微信正在写库）→ 返回空串，服务端会忽略空值，
+      避免把已经正确的名字覆盖回去；
+    - 系统消息（入群、企业存档提示等）没有单一发送者 → 「系统」；
+    - 其余解析不出来的 → 「未知成员」/「未知」。绝不把微信内部数字 ID 当名字发出去，
+      原始数字在 sender_id 列里本来就有。
+    """
+    if not n2i:
+        return ""
+    name = db._resolve_sender(row["real_sender_id"], n2i, nicks, self_nick, chat,
+                              self_username=account)
+    if name != str(row["real_sender_id"]):
+        return name
+    if exported["type_code"] == 10000:
+        return "系统"
+    return "未知成员" if str(chat).endswith("@chatroom") else "未知"
+
+
 def scan_messages(db, watermark=None):
     """返回 {chat: [消息 dict 升序]} 与统计。同完整键重复时保留首条并计数。
 
@@ -731,9 +753,8 @@ def scan_messages(db, watermark=None):
                 "type": _s(e["type"], 32),
                 "type_code": _int32(e["type_code"]),
                 "sender_id": _s(e["sender_id"], 64),
-                "sender_name": _s(db._resolve_sender(
-                    r["real_sender_id"], n2i, nicks, self_nick, chat,
-                    self_username=account), 255),
+                "sender_name": _s(_sender_name(
+                    db, r, n2i, nicks, self_nick, chat, account, e), 255),
                 "create_time": _nn(e["create_time"]),
                 "content": _text(e["content"], 16777215),
                 "server_id": _opt_int(e["server_id"]),
