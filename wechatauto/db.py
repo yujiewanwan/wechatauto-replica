@@ -1654,6 +1654,10 @@ class WeChatDB:
         for rel, path, _ in self._db_files:
             if os.path.basename(path) != "message_resource.db":
                 continue
+            # 该库密钥取不到时（微信升级后密钥缓存失效）不要阻断整个消息同步：
+            # 它只用于把 real_sender_id 解析成发送者用户名，缺了会退化到昵称/原始 id。
+            if rel in self.unkeyed:
+                continue
             conn = self._open(rel)
             try:
                 for rid, u in conn.execute(

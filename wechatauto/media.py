@@ -305,8 +305,12 @@ class MediaDownloader:
                 return found
         return None
 
-    def detect_image_key(self, refresh: bool = False) -> Optional[Tuple[str, int]]:
+    def detect_image_key(self, refresh: bool = False,
+                         monitor_timeout: float = 120.0) -> Optional[Tuple[str, int]]:
         """返回 (AES 密钥, XOR 密钥)；失败返回 None。结果缓存，refresh=True 强制重扫。
+
+        monitor_timeout 是内存扫描失败后等待「用户点开一张图」的秒数；定时任务里
+        可以传 0 避免每轮白等（微信只在看图后才会把图片密钥放进内存）。
 
         总流程:
           定位缓存目录 → 收集 *_t.dat 模板 → 文件尾推 XOR 密钥(众数统计)
@@ -338,7 +342,9 @@ class MediaDownloader:
         if not aes_key:
             aes_key = self._load_persisted_key()
         if not aes_key:
-            aes_key = self._scan_aes_key(monitor=True)
+            # monitor_timeout<=0 表示不等待人工看图，扫一次就收工（定时任务用）
+            aes_key = self._scan_aes_key(monitor=monitor_timeout > 0,
+                                         monitor_timeout=monitor_timeout)
             if aes_key:
                 self._persist_key(aes_key)
         if not aes_key:
