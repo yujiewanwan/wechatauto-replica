@@ -1,4 +1,4 @@
-"""把本机微信数据同步到 aizee 服务端（消息/联系人/群/群成员/会话 + 图片）。
+"""把本机微信数据同步到 aizee 服务端（账号/消息/联系人/群/群成员/会话 + 图片）。
 
 两个入口：
 
@@ -6,19 +6,37 @@
     py sync_to_server.py incremental    # 增量：定时 job 就跑这个
 
 增量入口自己管节奏，每台机器只需要加一个定时任务（建议 5~15 分钟）：
-消息和图片每轮都同步；四类实体超过 24 小时才重新整表覆盖；超过 7 天做一次
-全量兜底（微信换设备登录会补写低于水位线的历史消息，按水位线收窄的扫描
-看不见它们）。节奏状态存在 _sync_state.json，不需要配多个 job。
+账号自身信息、消息和图片每轮都同步；四类实体超过 24 小时才重新整表覆盖；
+超过 7 天做一次全量兜底（微信换设备登录会补写低于水位线的历史消息，按水位线
+收窄的扫描看不见它们）。节奏状态存在 _sync_state.json，不需要配多个 job。
 
 手动入口（排障用，跳过节奏判断）：
 
     py sync_to_server.py entities | messages | media | sweep
 
-token 从环境变量读取，不写入仓库；不传则只能跑不涉及图片上传的步骤：
+token 从环境变量/.env 读取，不写入仓库：
 
-    AIZEE_TOKEN=xxx py sync_to_server.py incremental
+- WECHAT_SYNC_TOKEN：同步服务的凭据（必填）。归档接口和图库都在同一个服务上、
+  用同一个凭据，所以只配这一个就够了。
+- AIZEE_TOKEN：图库 token。留空时自动复用 WECHAT_SYNC_TOKEN，只有图库凭据与
+  同步凭据不同的部署才需要单独配。
+
+    WECHAT_SYNC_TOKEN=xxx py sync_to_server.py incremental
+
+要连别的服务（例如本地自建的 prime-contact）时才用这几个开关：
+
+- WECHAT_SYNC_BASE=http://127.0.0.1:9001/api/wechat：换服务地址。
+- WECHAT_SYNC_AUTH=exchange：只有老的 aizee-crm 网关才需要（它要把 api token
+  换成短期 JWT）；prime 这套默认 direct，token 直接当 Bearer 用。
+- WECHAT_SYNC_HEALTH_PATH=/actuator/health：换健康探针路径。
+- WECHAT_SYNC_ENV_FILE=.env.xxx：换读另一份配置，不动 .env。
+- SEND_SENDER_USERNAME=1：服务端 wechat_messages 有 sender_username 列时才开。
 
 实现要点（均已实测验证）：
+- 服务端接口不带版本前缀（/messages 而不是 /v1/messages）。SYNC_BASE 已含
+  服务前缀 /api/wechat，再拼版本段会被网关判为未声明路由，直接 403。
+- account 只是各表的关联键，本身不含身份信息，所以每轮单独上报一次账号自身
+  的昵称/微信号/头像（取自本地 contact 表里 username == wxid 的那行）。
 - 消息以 (account, chat, sort_seq, local_id) 幂等，可重复执行、可中断续传。
   sort_seq 是秒级时间戳，同秒多条消息必然撞号，故 local_id 必须在唯一键内。
 - 同一 chat 按 sort_seq 升序发送，前一批 200 后再发下一批，整会话确认后才
@@ -30,11 +48,15 @@ token 从环境变量读取，不写入仓库；不传则只能跑不涉及图�
 - 图库只接受 png/jpg/jpeg/webp/gif；wxgf(HEVC) 原图经 ffmpeg 转 jpg，缺
   ffmpeg 时回退缩略图。画质变体编进图库名，日后补原图不会撞重名。
 - 同一账号同时只允许一个同步进程（锁文件），否则会并行推进同一 chat 的水位线。
+- 响应外壳两种宿主都兼容：aizee-crm 顶层直接给业务字段，prime-contact 用
+  BaseResponse 且业务失败也回 HTTP 200（code=400/500）。因此只判 HTTP 状态码不够，
+  必须同时要求 code==200，否则失败会被当成功、水位线会被推进到没落库的位置。
 """
 
 import json
 import os
 import re
+import socket
 import sqlite3
 import sys
 import time
@@ -54,8 +76,12 @@ def load_dotenv(path=None):
     已存在的真实环境变量优先（与 dotenv 惯例一致），便于临时覆盖：
         AIZEE_TOKEN=xxx py sync_to_server.py ...
     支持 `KEY=VALUE`、`export KEY=VALUE`、# 注释、空行、值两侧的引号。
+
+    默认读同目录 .env；联调其它宿主时用 WECHAT_SYNC_ENV_FILE 指向别的配置文件，
+    这样不用为了连本地服务去改生产 .env。
     """
-    path = path or os.path.join(_HERE, ".env")
+    path = path or os.environ.get("WECHAT_SYNC_ENV_FILE") \
+        or os.path.join(_HERE, ".env")
     try:
         raw = open(path, "rb").read()
     except OSError:
@@ -96,9 +122,33 @@ def _env_int(key, default):
         return default
 
 
-SYNC_BASE = os.environ.get("WECHAT_SYNC_BASE", "http://127.0.0.1:9005").rstrip("/")
-GALLERY_BASE = os.environ.get("AIZEE_GALLERY_BASE", "https://primeapi.aizee.cc").rstrip("/")
-TOKEN = os.environ.get("AIZEE_TOKEN", "")
+# 现在归档接口和图库接口都在同一个服务上（prime 那套），只是路径不同：
+#   /api/wechat        传消息/联系人/会话/水位线
+#   /api/file-gallery  传图片二进制
+# 所以两个地址默认同主机。换服务时才需要改。
+SYNC_BASE = os.environ.get("WECHAT_SYNC_BASE",
+                           "https://primeapi.aizee.cc/api/wechat").rstrip("/")
+GALLERY_BASE = os.environ.get("AIZEE_GALLERY_BASE",
+                              "https://primeapi.aizee.cc").rstrip("/")
+
+# 同步 token。同一个服务既用它鉴权归档接口、也用它传图库，所以只配这一个就够了：
+# AIZEE_TOKEN 留空时自动复用同步 token，只有图库 token 与同步 token 不同的部署才需要另配。
+SYNC_TOKEN = os.environ.get("WECHAT_SYNC_TOKEN", "")
+TOKEN = os.environ.get("AIZEE_TOKEN", "") or SYNC_TOKEN
+
+# 认证方式。两种宿主的鉴权入口不同：
+#   direct   （默认）—— prime-contact 等宿主：JWT 与 user_api_token 明文 token 都直接
+#                      当 Bearer 用，没有 /user/auth/exchange 这个端点；
+#   exchange         —— 老的 aizee-crm 网关：api token 先换 5 分钟 JWT 再带 Bearer。
+SYNC_AUTH_MODE = os.environ.get("WECHAT_SYNC_AUTH", "direct").strip().lower()
+
+# 健康检查路径。prime 这套没有 /health，用归档接口自身当探针最可靠：
+# 一次请求同时验证「服务可达 + token 有效 + 归档模块已加载 + 数据库通」。
+HEALTH_PATH = os.environ.get("WECHAT_SYNC_HEALTH_PATH", "/watermark/__health__")
+
+# 抓图片 AES 密钥时等待「用户点开一张图」的秒数。微信只在点开图片查看后才把密钥放进
+# 内存，所以这段等待是留给人去看图的。定时任务里置 0，避免每轮白等两分钟。
+IMAGE_KEY_WAIT = _env_int("IMAGE_KEY_WAIT_SEC", 120)
 
 BATCH = _env_int("SYNC_BATCH", 500)                  # 单批条数，服务端上限 1000
 MAX_BODY = _env_int("SYNC_MAX_BODY", 24 * 1024 * 1024)   # 请求体上限，服务端 32MiB
@@ -113,9 +163,56 @@ def _lock_path(account):
     safe = re.sub(r"[^0-9A-Za-z_.-]", "_", account)
     return os.path.join(_HERE, "_sync_%s.lock" % safe)
 # 服务端加了 sender_username 列后保持 1；未加时置 0，否则整批 400 unknown field
-SEND_SENDER_USERNAME = os.environ.get("SEND_SENDER_USERNAME", "1") != "0"
+# 服务端 wechat_messages 有 sender_username 列时才发这个字段（发多了整批 400 unknown field）
+# prime 那套归档表没有这一列，所以默认不发
+SEND_SENDER_USERNAME = os.environ.get("SEND_SENDER_USERNAME", "0") != "0"
 ENTITY_INTERVAL = _env_int("ENTITY_INTERVAL_SEC", 24 * 3600)
 SWEEP_INTERVAL = _env_int("SWEEP_INTERVAL_SEC", 7 * 24 * 3600)
+
+# ----------------------------------------------------------------------
+# CRM 网关鉴权：api token(usr_*) → 短期 JWT(默认 5 分钟) → 请求头 Bearer。
+# 认证端点挂在网关 /api 根下，与同步服务的 /api/wechat 前缀不同级。
+# ----------------------------------------------------------------------
+_AUTH = {"jwt": "", "exp": 0.0, "refresh": ""}
+
+
+def _gateway_api_base():
+    """SYNC_BASE 所在网关的 /api 根（scheme://host/api），认证端点在这里。"""
+    parts = urllib.parse.urlsplit(SYNC_BASE)
+    return "%s://%s/api" % (parts.scheme, parts.netloc)
+
+
+def _auth_exchange(body, path):
+    data = json.dumps(body).encode("utf-8")
+    status, resp = _retry("POST", _gateway_api_base() + path, data,
+                          {"Content-Type": "application/json"})
+    payload = json.loads(resp.decode("utf-8", "replace"))
+    d = payload.get("data") if isinstance(payload, dict) else None
+    if status != 200 or not (d or {}).get("token"):
+        raise RuntimeError("CRM 认证失败: POST %s -> %d %s"
+                           % (path, status, resp[:300].decode("utf-8", "replace")))
+    _AUTH["jwt"] = d["token"]
+    _AUTH["exp"] = time.time() + int(d.get("expiresIn") or 300) - 60
+    if d.get("refreshToken"):
+        _AUTH["refresh"] = d["refreshToken"]
+
+
+def sync_auth_headers():
+    """返回同步服务请求头。direct 模式直接用 token；否则换发(或复用)JWT。"""
+    if not SYNC_TOKEN:
+        return {}
+    if SYNC_AUTH_MODE == "direct":
+        return {"Authorization": "Bearer " + SYNC_TOKEN}
+    if not _AUTH["jwt"] or time.time() >= _AUTH["exp"]:
+        if _AUTH["refresh"]:
+            try:
+                _auth_exchange({"refreshToken": _AUTH["refresh"]},
+                               "/user/auth/refresh")
+            except Exception:
+                _auth_exchange({"apiToken": SYNC_TOKEN}, "/user/auth/exchange")
+        else:
+            _auth_exchange({"apiToken": SYNC_TOKEN}, "/user/auth/exchange")
+    return {"Authorization": "Bearer " + _AUTH["jwt"]}
 
 # ----------------------------------------------------------------------
 # 单进程锁：同一账号并行推进同一 chat 的水位线会破坏「按序确认」语义
@@ -215,15 +312,40 @@ def _retry(method, url, body=None, headers=None, timeout=120, attempts=5):
     raise RuntimeError("重试 %d 次仍失败: %s" % (attempts, last))
 
 
-def sync_post(path, payload):
-    """向同步服务 POST JSON，非 200 视为致命错误（避免带着坏数据继续推进）。"""
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    status, data = _retry("POST", SYNC_BASE + path, body,
-                          {"Content-Type": "application/json"})
-    text = data.decode("utf-8", "replace")
+def _response(label, status, raw):
+    """校验响应并解出业务负载；不是 2xx 一律抛错，返回 dict。
+
+    两种宿主的响应外壳不同，这里都兼容：
+    - aizee-crm：顶层就是业务字段（total/inserted/... 或 watermark）；
+    - prime-contact：BaseResponse `{code,message,data}`，且**业务失败也用 HTTP 200
+      承载**（校验错误 code=400、数据库失败 code=500）。所以只判 HTTP 状态码会把
+      失败当成功，进而把水位线推进到没真正落库的位置 —— 必须同时检查 code。
+    """
+    text = raw.decode("utf-8", "replace")
     if status != 200:
-        raise RuntimeError("POST %s -> %d %s" % (path, status, text[:500]))
-    return json.loads(text)
+        raise RuntimeError("%s -> HTTP %d %s" % (label, status, text[:300]))
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    if "code" in payload:
+        if payload.get("code") != 200:
+            raise RuntimeError("%s -> code=%s %s" % (
+                label, payload.get("code"), str(payload.get("message"))[:200]))
+        data = payload.get("data")
+        return data if isinstance(data, dict) else {}
+    return payload
+
+
+def sync_post(path, payload):
+    """向同步服务 POST JSON，失败视为致命错误（避免带着坏数据继续推进）。"""
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = sync_auth_headers()
+    headers["Content-Type"] = "application/json"
+    status, data = _retry("POST", SYNC_BASE + path, body, headers)
+    return _response("POST " + path, status, data)
 
 
 def sync_put_watermark(account, marks):
@@ -232,12 +354,12 @@ def sync_put_watermark(account, marks):
     for i in range(0, len(items), WM_BATCH):
         chunk = dict(items[i:i + WM_BATCH])
         body = json.dumps({"watermark": chunk}).encode("utf-8")
-        status, data = _retry("PUT", "%s/v1/watermark/%s"
+        headers = sync_auth_headers()
+        headers["Content-Type"] = "application/json"
+        status, data = _retry("PUT", "%s/watermark/%s"
                               % (SYNC_BASE, urllib.parse.quote(account)),
-                              body, {"Content-Type": "application/json"})
-        if status != 200:
-            raise RuntimeError("PUT watermark -> %d %s"
-                               % (status, data[:300].decode("utf-8", "replace")))
+                              body, headers)
+        _response("PUT watermark", status, data)
 
 
 def gallery_get_by_name(name):
@@ -350,6 +472,64 @@ def send_batches(path, account, key, items):
 
 
 # ----------------------------------------------------------------------
+# 账号自身信息：account 是各表的关联键，本身不含身份信息，单独上报一行
+# ----------------------------------------------------------------------
+def collect_self(db, account):
+    """采集账号自己的昵称/微信号/头像。
+
+    微信把自己也存在 contact 表里（username == wxid），alias 是用户自设的微信号，
+    big_head_url 是公网 CDN 地址（不经图库）。查不到那行时仍上报一行，让服务端
+    至少有这个 account 的存在记录和活跃时间。
+    """
+    row = None
+    conn = db._contact_conn()
+    if conn:
+        try:
+            row = conn.execute(
+                "SELECT alias, nick_name, remark, big_head_url FROM contact "
+                "WHERE username=? LIMIT 1", (account,)).fetchone()
+        except sqlite3.DatabaseError:
+            row = None
+        finally:
+            conn.close()
+    return {
+        "alias": _s(row["alias"], 255) if row else "",
+        "nick_name": _s(row["nick_name"], 255) if row else "",
+        "remark": _s(row["remark"], 255) if row else "",
+        "avatar_url": _s(row["big_head_url"], 1024) if row else "",
+        "collector_host": _s(socket.gethostname(), 255),
+        "last_sync_at": int(time.time()),
+    }
+
+
+def sync_account(db, account):
+    """上报账号自身信息，每轮一行。失败只告警，绝不打断本轮同步。
+
+    last_sync_at 每轮都变，所以这行必然记 updated —— 这是有意的：其余实体无变化
+    时不写库、updated_at 不动，没有它就分不清「账号信息没变」和「采集机挂了」。
+
+    这一行是运维元数据，价值远低于消息，所以任何失败都只打日志：服务端未部署
+    /accounts 时网关返回 500（未声明路由不是 404），而 500 同时也是「数据库写入
+    失败、应退避重试」的正常信号，无法靠状态码区分两者。与其猜，不如让消息同步
+    照常进行，把失败原因打出来由运维判断。
+    """
+    item = collect_self(db, account)
+    body = json.dumps({"account": account, "accounts": [item]},
+                      ensure_ascii=False).encode("utf-8")
+    try:
+        headers = sync_auth_headers()
+        headers["Content-Type"] = "application/json"
+        status, data = _retry("POST", SYNC_BASE + "/accounts", body, headers)
+        _response("POST /accounts", status, data)
+        print("账号信息: %s（%s）" % (item["nick_name"] or "昵称未取到",
+                                     item["alias"] or "无微信号"))
+        return item
+    except Exception as exc:
+        print("账号信息上报失败，跳过本轮: %s: %s" % (type(exc).__name__, exc))
+    return None
+
+
+# ----------------------------------------------------------------------
 # 四类 upsert 实体
 # ----------------------------------------------------------------------
 def collect_contacts(db):
@@ -409,7 +589,7 @@ def sync_entities(db, account):
     contacts = collect_contacts(db)
     print("联系人 %d 条" % len(contacts))
     if contacts:
-        print("   ", send_batches("/v1/contacts", account, "contacts", contacts))
+        print("   ", send_batches("/contacts", account, "contacts", contacts))
 
     groups = db.get_groups()
     rooms, members = [], []
@@ -434,16 +614,16 @@ def sync_entities(db, account):
             })
     print("群 %d 个" % len(rooms))
     if rooms:
-        print("   ", send_batches("/v1/chatrooms", account, "chatrooms", rooms))
+        print("   ", send_batches("/chatrooms", account, "chatrooms", rooms))
     print("群成员 %d 条" % len(members))
     if members:
-        print("   ", send_batches("/v1/chatroom_members", account,
+        print("   ", send_batches("/chatroom_members", account,
                                   "chatroom_members", members))
 
     sessions = collect_sessions(db)
     print("会话 %d 条" % len(sessions))
     if sessions:
-        print("   ", send_batches("/v1/sessions", account, "sessions", sessions))
+        print("   ", send_batches("/sessions", account, "sessions", sessions))
 
 
 # ----------------------------------------------------------------------
@@ -552,9 +732,11 @@ def sync_messages(db, account, incremental=False):
     incremental=True 时按服务端水位线收窄扫描范围；返回 (totals, by_chat)，
     by_chat 供媒体步骤复用，避免重复扫库。
     """
-    status, data = _retry("GET", "%s/v1/watermark/%s"
-                          % (SYNC_BASE, urllib.parse.quote(account)))
-    known = json.loads(data).get("watermark", {}) if status == 200 else {}
+    status, data = _retry("GET", "%s/watermark/%s"
+                          % (SYNC_BASE, urllib.parse.quote(account)),
+                          None, sync_auth_headers())
+    # prime-contact 把水位线放在 data.watermark 里，aizee-crm 直接放顶层，_response 已统一
+    known = _response("GET watermark", status, data).get("watermark", {}) or {}
     print("服务端已有水位线 %d 个会话" % len(known))
 
     by_chat, stat = scan_messages(db, known if incremental else None)
@@ -568,7 +750,7 @@ def sync_messages(db, account, incremental=False):
     for chat in sorted(by_chat):
         msgs = by_chat[chat]
         for i in range(0, len(msgs), BATCH):
-            r = send_batches("/v1/messages", account, "messages", msgs[i:i + BATCH])
+            r = send_batches("/messages", account, "messages", msgs[i:i + BATCH])
             for k in totals:
                 totals[k] += r[k]
         # 整个会话已逐批确认落库，才把最大 sort_seq 作为水位线前缀
@@ -662,10 +844,18 @@ def sync_media(db, account, by_chat=None):
     by_md5 = scan_images(db, by_chat)
     print("图片消息 %d 条，唯一 md5 %d 个"
           % (sum(len(v) for v in by_md5.values()), len(by_md5)))
+    if not by_md5:
+        print("本轮没有图片消息，跳过图片上传")
+        return
 
     dl = MediaDownloader(db)
-    if not dl.detect_image_key():
-        raise SystemExit("取不到图片解密密钥（确认微信已登录并在运行）")
+    if not dl.detect_image_key(monitor_timeout=IMAGE_KEY_WAIT):
+        # 图片是附加信息，不该拖垮整轮：这里只跳过图片，消息和实体照常。
+        # 用 SystemExit 会绕过 main() 里按账号隔离的 except Exception，导致本轮
+        # 后续账号完全不处理（而且退出码语义也对不上「图片这步跳过」）。
+        print("取不到图片解密密钥（确认微信已登录并点开过一张图）；"
+              "本轮跳过图片，消息同步不受影响")
+        return
 
     attach = {}
     for root, _, files in os.walk(os.path.join(db.account_dir, "msg", "attach")):
@@ -730,7 +920,7 @@ def sync_media(db, account, by_chat=None):
         # 先落盘 pending 再发送：发送中崩溃时下一轮仍会重试
         _acct_state(state, account)["pending_backfill"] = backfill[:5000]
         _save_json(STATE_PATH, state)
-        print("   ", send_batches("/v1/messages", account, "messages", backfill))
+        print("   ", send_batches("/messages", account, "messages", backfill))
         state = _load_json(STATE_PATH, {})
         _acct_state(state, account)["pending_backfill"] = []     # 已确认落库
         _save_json(STATE_PATH, state)
@@ -741,6 +931,9 @@ def _run(cmd, db, account):
     full = _load_json(STATE_PATH, {})
     state = _acct_state(full, account)
     now = int(time.time())
+
+    # 一行数据，不进 24 小时节流：否则 last_sync_at 反映不了采集活跃度
+    sync_account(db, account)
 
     if cmd == "init":
         sync_entities(db, account)
@@ -811,9 +1004,16 @@ def main():
     if cmd not in ("init", "incremental", "entities", "messages", "media", "sweep"):
         raise SystemExit(__doc__)
 
-    status, _ = _retry("GET", SYNC_BASE + "/v1/health", attempts=2)
-    if status != 200:
-        raise SystemExit("同步服务不可用: %s %s" % (SYNC_BASE, status))
+    status, body = _retry("GET", SYNC_BASE + HEALTH_PATH, None,
+                          sync_auth_headers(), attempts=2)
+    try:
+        health = _response("GET " + HEALTH_PATH, status, body)
+    except RuntimeError as exc:
+        raise SystemExit("同步服务不可用: %s %s" % (SYNC_BASE, exc))
+    # prime-contact 的 actuator 健康端点返回 {"status":"UP"}，DOWN 要拦住
+    if health.get("status") not in (None, "UP"):
+        raise SystemExit("同步服务不健康: %s status=%s"
+                         % (SYNC_BASE, health.get("status")))
 
     targets = _pick_accounts(want)
     print("[%s] %s，本轮 %d 个账号 → %s"
