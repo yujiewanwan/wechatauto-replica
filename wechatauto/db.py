@@ -527,7 +527,11 @@ class WeChatDB:
         for rel, path, _ in self._db_files:
             if os.path.basename(path) != "contact.db":
                 continue
-            conn = self._open(rel)
+            try:
+                conn = self._open(rel)
+            except Exception:
+                # 无 contact.db 密钥时只影响昵称，不应阻断其它库的同步
+                return {"username": self.wxid, "nick_name": "", "remark": ""}
             row = conn.execute(
                 "SELECT username, nick_name, remark FROM contact WHERE username=? LIMIT 1",
                 (self.wxid,),
@@ -1617,6 +1621,8 @@ class WeChatDB:
             base = os.path.basename(path)
             if base not in ("contact.db", "session.db"):
                 continue
+            if rel in self.unkeyed:
+                continue
             conn = self._open(rel)
             try:
                 if base == "contact.db":
@@ -1634,6 +1640,8 @@ class WeChatDB:
         idx = {}
         for rel, path, _ in self._db_files:
             if os.path.basename(path) != "contact.db":
+                continue
+            if rel in self.unkeyed:
                 continue
             conn = self._open(rel)
             try:

@@ -474,13 +474,83 @@ def send_batches(path, account, key, items):
 # ----------------------------------------------------------------------
 # 账号自身信息：account 是各表的关联键，本身不含身份信息，单独上报一行
 # ----------------------------------------------------------------------
-def collect_self(db, account):
-    """采集账号自己的昵称/微信号/头像。
+def _sibling_contact_row(wxid):
+    """本机其它账号的 contact.db 反查该 wxid 的资料行（同机多账号通常互为联系人）。
 
-    微信把自己也存在 contact 表里（username == wxid），alias 是用户自设的微信号，
-    big_head_url 是公网 CDN 地址（不经图库）。查不到那行时仍上报一行，让服务端
-    至少有这个 account 的存在记录和活跃时间。
+    只在自己 contact.db 密钥缺失时兜底。打开 sibling 库之前做全量预检：
+    磁盘上每个库都要有仍能通过页 1 HMAC 校验的缓存密钥，否则跳过——
+    防止构造 WeChatDB 时为缺密钥的库触发整轮内存扫描。
     """
+    import tempfile
+    from wechatauto import db as _dbm
+
+    try:
+        db_dir = _dbm.auto_detect_db_dir()
+        if not db_dir:
+            return None
+        for a in list_accounts(db_dir):
+            if a["wxid"] == wxid:
+                continue
+            kf = os.path.join(tempfile.gettempdir(), "wechatauto_db",
+                              a["account"], "keys.json")
+            try:
+                with open(kf, encoding="utf-8") as f:
+                    saved = json.load(f)
+            except Exception:
+                continue
+            if not saved.get("contact\\contact.db"):
+                continue
+            base = os.path.join(db_dir, a["account"], "db_storage")
+            ok = True
+            for root, _, names in os.walk(base):
+                if os.path.normcase(os.path.relpath(root, base)).startswith("migrate"):
+                    continue
+                for name in names:
+                    if not name.endswith(".db") or name.endswith(("-wal", "-shm")):
+                        continue
+                    rel = os.path.relpath(os.path.join(root, name), base)
+                    hexkey = saved.get(rel)
+                    if not hexkey:
+                        ok = False
+                        break
+                    try:
+                        with open(os.path.join(root, name), "rb") as f:
+                            page1 = f.read(_dbm.PAGE_SZ)
+                        if not _dbm._verify_enc_key(bytes.fromhex(hexkey), page1):
+                            ok = False
+                            break
+                    except Exception:
+                        ok = False
+                        break
+                if not ok:
+                    break
+            if not ok:
+                continue
+            try:
+                odb = WeChatDB(account=a["account"], db_dir=db_dir)
+                conn = odb._contact_conn()
+                if not conn:
+                    continue
+                try:
+                    return conn.execute(
+                        "SELECT alias, nick_name, remark, big_head_url FROM contact "
+                        "WHERE username=? LIMIT 1", (wxid,)).fetchone()
+                finally:
+                    conn.close()
+            except Exception:
+                continue
+        return None
+    except Exception:
+        return None
+
+
+_SELF_ROWS = {}
+
+
+def _self_row(db, account):
+    """自己那行 contact：本库优先，缺失时用 sibling 账号兜底（每轮缓存一次）。"""
+    if account in _SELF_ROWS:
+        return _SELF_ROWS[account]
     row = None
     conn = db._contact_conn()
     if conn:
@@ -492,6 +562,20 @@ def collect_self(db, account):
             row = None
         finally:
             conn.close()
+    if row is None:
+        row = _sibling_contact_row(account)
+    _SELF_ROWS[account] = row
+    return row
+
+
+def collect_self(db, account):
+    """采集账号自己的昵称/微信号/头像。
+
+    微信把自己也存在 contact 表里（username == wxid），alias 是用户自设的微信号，
+    big_head_url 是公网 CDN 地址（不经图库）。查不到那行时仍上报一行，让服务端
+    至少有这个 account 的存在记录和活跃时间。
+    """
+    row = _self_row(db, account)
     return {
         "alias": _s(row["alias"], 255) if row else "",
         "nick_name": _s(row["nick_name"], 255) if row else "",
@@ -702,7 +786,8 @@ def scan_messages(db, watermark=None):
     idx = db._build_md5_index()
     nicks = db._nickname_index()
     account = db.wxid
-    self_nick = db.get_self_info().get("nick_name", "我")
+    row = _self_row(db, account)
+    self_nick = (row["nick_name"] if row else "") or "我"
 
     raw = {}
     for rel in db._message_dbs():
