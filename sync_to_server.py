@@ -593,8 +593,11 @@ def collect_self(db, account):
 def sync_account(db, account):
     """上报账号自身信息，每轮一行。失败只告警，绝不打断本轮同步。
 
-    last_sync_at 每轮都变，所以这行必然记 updated —— 这是有意的：其余实体无变化
-    时不写库、updated_at 不动，没有它就分不清「账号信息没变」和「采集机挂了」。
+    这一行也是采集心跳：只在本轮消息同步成功之后才调用，所以 last_sync_at 表示
+    「这个账号最近一次消息同步成功的时间」。取不到密钥、消息同步失败的账号不会刷新
+    它，商机提醒插件据此判断采集是否停了。last_sync_at 每轮都变，所以这行必然记
+    updated —— 这是有意的：其余实体无变化时不写库、updated_at 不动，没有它就分不清
+    「账号信息没变」和「采集机挂了」。
 
     这一行是运维元数据，价值远低于消息，所以任何失败都只打日志：服务端未部署
     /accounts 时网关返回 500（未声明路由不是 404），而 500 同时也是「数据库写入
@@ -1065,12 +1068,12 @@ def _run(cmd, db, account):
     state = _acct_state(full, account)
     now = int(time.time())
 
-    # 一行数据，不进 24 小时节流：否则 last_sync_at 反映不了采集活跃度
-    sync_account(db, account)
-
+    # 心跳 sync_account 放在消息同步成功之后、图片之前：失败的轮次不刷新心跳，
+    # 图片慢也不拖后心跳。它只有一行数据，不进 24 小时节流。
     if cmd == "init":
         sync_entities(db, account)
         _, by_chat = sync_messages(db, account, incremental=False)
+        sync_account(db, account)
         state["last_entities"] = state["last_sweep"] = now
         if TOKEN:
             sync_media(db, account, by_chat)
@@ -1081,6 +1084,7 @@ def _run(cmd, db, account):
         state["last_entities"] = now
     elif cmd in ("messages", "sweep"):
         sync_messages(db, account, incremental=(cmd == "messages"))
+        sync_account(db, account)
         if cmd == "sweep":
             state["last_sweep"] = now
     elif cmd == "media":
@@ -1096,6 +1100,7 @@ def _run(cmd, db, account):
         sweep = now - int(state.get("last_sweep", 0)) >= SWEEP_INTERVAL
         print("本轮消息范围:", "全量兜底" if sweep else "增量")
         _, by_chat = sync_messages(db, account, incremental=not sweep)
+        sync_account(db, account)
         if sweep:
             state["last_sweep"] = now
         if TOKEN:
@@ -1107,6 +1112,11 @@ def _run(cmd, db, account):
     _acct_state(latest, account).update(
         {k: v for k, v in state.items() if k != "pending_backfill"})
     _save_json(STATE_PATH, latest)
+
+
+def _no_key(exc):
+    """取不到数据库密钥：通常是这个账号的微信没登录，属于运维状态，不是同步故障。"""
+    return isinstance(exc, RuntimeError) and str(exc).startswith("数据库无可用密钥")
 
 
 def _pick_accounts(want):
@@ -1153,6 +1163,7 @@ def main():
           % (time.strftime("%Y-%m-%d %H:%M:%S"), cmd, len(targets), SYNC_BASE))
     t_all = time.time()
     failed = []
+    skipped = []
     for a in targets:
         # 每个账号独立上锁；同一账号绝不并行，不同账号互不阻塞
         if not acquire_lock(a["account"]):
@@ -1168,6 +1179,12 @@ def main():
             _run(cmd, db, account)
             print("--- %s 完成，耗时 %.1fs" % (account, time.time() - t0))
         except Exception as exc:
+            if _no_key(exc):
+                # 未登录的账号只告警、不算失败，否则退出码天天是 1，真正的故障反而看不出来。
+                # 它的心跳不会刷新，采集停了由商机提醒插件提示。
+                skipped.append((a["wxid"], str(exc).split("。")[0]))
+                print("--- %s 跳过（警告）: 取不到数据库密钥，这个微信可能没有登录" % a["wxid"])
+                continue
             # 一个账号失败不影响其他账号，末尾统一报告并以非零码退出
             failed.append((a["wxid"], "%s: %s" % (type(exc).__name__, exc)))
             print("--- %s 失败: %s: %s" % (a["wxid"], type(exc).__name__, exc))
@@ -1175,6 +1192,10 @@ def main():
             release_lock(a["account"])
 
     print("\n全部完成，总耗时 %.1fs" % (time.time() - t_all))
+    if skipped:
+        print("警告：%d 个账号取不到数据库密钥，已跳过（不计为失败，请确认这些微信已登录）:" % len(skipped))
+        for wxid, why in skipped:
+            print("  %s  %s" % (wxid, why))
     if failed:
         print("失败 %d 个账号:" % len(failed))
         for wxid, why in failed:
