@@ -30,6 +30,8 @@ token 从环境变量/.env 读取，不写入仓库：
   换成短期 JWT）；prime 这套默认 direct，token 直接当 Bearer 用。
 - WECHAT_SYNC_HEALTH_PATH=/actuator/health：换健康探针路径。
 - WECHAT_SYNC_ENV_FILE=.env.xxx：换读另一份配置，不动 .env。
+- WECHAT_SYNC_COLLECTOR=collector-A：显式机器标识，写进 wechat_accounts.collector_host。
+  克隆机不改计算机名时 hostname 会撞名，多台采集机必须各自配不同的值。
 - SEND_SENDER_USERNAME=1：服务端 wechat_messages 有 sender_username 列时才开。
 
 实现要点（均已实测验证）：
@@ -150,8 +152,8 @@ HEALTH_PATH = os.environ.get("WECHAT_SYNC_HEALTH_PATH", "/watermark/__health__")
 # 内存，所以这段等待是留给人去看图的。定时任务里置 0，避免每轮白等两分钟。
 IMAGE_KEY_WAIT = _env_int("IMAGE_KEY_WAIT_SEC", 120)
 
-BATCH = _env_int("SYNC_BATCH", 500)                  # 单批条数，服务端上限 1000
-MAX_BODY = _env_int("SYNC_MAX_BODY", 24 * 1024 * 1024)   # 请求体上限，服务端 32MiB
+BATCH = _env_int("SYNC_BATCH", 200)                  # 单批条数，服务端上限 1000
+MAX_BODY = _env_int("SYNC_MAX_BODY", 8 * 1024 * 1024)   # 请求体上限，服务端 32MiB
 WM_BATCH = _env_int("SYNC_WM_BATCH", 500)            # 单次 PUT 的 chat 数，上限 1000
 # md5 -> {name, url}。按内容哈希去重，多账号共享：同一张图不同账号发过也只上传一次
 CACHE_PATH = os.path.join(_HERE, "_media_url_cache.json")
@@ -581,7 +583,9 @@ def collect_self(db, account):
         "nick_name": _s(row["nick_name"], 255) if row else "",
         "remark": _s(row["remark"], 255) if row else "",
         "avatar_url": _s(row["big_head_url"], 1024) if row else "",
-        "collector_host": _s(socket.gethostname(), 255),
+        # 克隆采集机可能不改计算机名导致 hostname 撞名；显式配置优先
+        "collector_host": _s(os.environ.get("WECHAT_SYNC_COLLECTOR")
+                             or socket.gethostname(), 255),
         "last_sync_at": int(time.time()),
     }
 
