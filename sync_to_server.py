@@ -587,15 +587,18 @@ def collect_self(db, account):
         "collector_host": _s(os.environ.get("WECHAT_SYNC_COLLECTOR")
                              or socket.gethostname(), 255),
         "last_sync_at": int(time.time()),
+        "newest_message_time": int(newest_message_time or 0),
     }
 
 
-def sync_account(db, account):
+def sync_account(db, account, newest_message_time=0):
     """上报账号自身信息，每轮一行。失败只告警，绝不打断本轮同步。
 
-    这一行也是采集心跳：只在本轮消息同步成功之后才调用，所以 last_sync_at 表示
-    「这个账号最近一次消息同步成功的时间」。取不到密钥、消息同步失败的账号不会刷新
-    它，商机提醒插件据此判断采集是否停了。last_sync_at 每轮都变，所以这行必然记
+    这一行同时是采集心跳，字段含义要分清楚：
+    - last_sync_at：本机这一轮读库成功的时间。只能说明采集机活着、这个账号读得出来。
+    - newest_message_time：本机库里读到的最新消息时间。它才说明这个微信还在产生消息；
+      微信掉线时账号目录还在、扫描照常跑完，这个值会停在掉线那一刻。
+    取不到密钥、消息同步失败的账号根本不会调用这里，所以心跳不会被谎报刷新。last_sync_at 每轮都变，所以这行必然记
     updated —— 这是有意的：其余实体无变化时不写库、updated_at 不动，没有它就分不清
     「账号信息没变」和「采集机挂了」。
 
@@ -605,6 +608,7 @@ def sync_account(db, account):
     照常进行，把失败原因打出来由运维判断。
     """
     item = collect_self(db, account)
+    item["newest_message_time"] = int(newest_message_time or 0)
     body = json.dumps({"account": account, "accounts": [item]},
                       ensure_ascii=False).encode("utf-8")
     try:
@@ -612,8 +616,10 @@ def sync_account(db, account):
         headers["Content-Type"] = "application/json"
         status, data = _retry("POST", SYNC_BASE + "/accounts", body, headers)
         _response("POST /accounts", status, data)
-        print("账号信息: %s（%s）" % (item["nick_name"] or "昵称未取到",
-                                     item["alias"] or "无微信号"))
+        print("账号信息: %s（%s），本机最新消息 %s" % (
+            item["nick_name"] or "昵称未取到", item["alias"] or "无微信号",
+            time.strftime("%m-%d %H:%M", time.localtime(newest_message_time))
+            if newest_message_time else "无"))
         return item
     except Exception as exc:
         print("账号信息上报失败，跳过本轮: %s: %s" % (type(exc).__name__, exc))
@@ -901,7 +907,12 @@ def sync_messages(db, account, incremental=False):
     if pending:
         sync_put_watermark(account, pending)
     print("消息合计:", totals)
-    return totals, by_chat
+    # 本机库里读到的最新消息时间（unix 秒）。上报给服务端，用来区分
+    # 「采集机活着」和「这个微信还在产生消息」：一个已经掉线的微信目录还在，
+    # 扫描照常跑完，但 newest 会停在掉线那一刻。
+    newest = max((m["create_time"] for msgs in by_chat.values() for m in msgs),
+                 default=0)
+    return totals, by_chat, int(newest)
 
 
 # ----------------------------------------------------------------------
@@ -1072,8 +1083,8 @@ def _run(cmd, db, account):
     # 图片慢也不拖后心跳。它只有一行数据，不进 24 小时节流。
     if cmd == "init":
         sync_entities(db, account)
-        _, by_chat = sync_messages(db, account, incremental=False)
-        sync_account(db, account)
+        _, by_chat, newest = sync_messages(db, account, incremental=False)
+        sync_account(db, account, newest)
         state["last_entities"] = state["last_sweep"] = now
         if TOKEN:
             sync_media(db, account, by_chat)
@@ -1083,8 +1094,8 @@ def _run(cmd, db, account):
         sync_entities(db, account)
         state["last_entities"] = now
     elif cmd in ("messages", "sweep"):
-        sync_messages(db, account, incremental=(cmd == "messages"))
-        sync_account(db, account)
+        _, _, newest = sync_messages(db, account, incremental=(cmd == "messages"))
+        sync_account(db, account, newest)
         if cmd == "sweep":
             state["last_sweep"] = now
     elif cmd == "media":
@@ -1099,8 +1110,8 @@ def _run(cmd, db, account):
         # 所以周期性做一次全量兜底（全部幂等 skipped，只补真正缺的）
         sweep = now - int(state.get("last_sweep", 0)) >= SWEEP_INTERVAL
         print("本轮消息范围:", "全量兜底" if sweep else "增量")
-        _, by_chat = sync_messages(db, account, incremental=not sweep)
-        sync_account(db, account)
+        _, by_chat, newest = sync_messages(db, account, incremental=not sweep)
+        sync_account(db, account, newest)
         if sweep:
             state["last_sweep"] = now
         if TOKEN:
