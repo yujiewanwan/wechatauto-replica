@@ -587,7 +587,7 @@ def collect_self(db, account):
         "collector_host": _s(os.environ.get("WECHAT_SYNC_COLLECTOR")
                              or socket.gethostname(), 255),
         "last_sync_at": int(time.time()),
-        "newest_message_time": int(newest_message_time or 0),
+        # 本机读到的最新消息时间由 sync_account 填：它才知道本轮扫库的结果
     }
 
 
