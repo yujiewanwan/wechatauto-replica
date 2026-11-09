@@ -3,6 +3,7 @@
 两个入口：
 
     py sync_to_server.py init          # 首次初始化：全量上传
+    py sync_to_server.py profiles       # PRIME：朋友资料及标签全量同步
     py sync_to_server.py incremental    # 增量：定时 job 就跑这个
 
 增量入口自己管节奏，每台机器只需要加一个定时任务（建议 5~15 分钟）：
@@ -1081,6 +1082,13 @@ def _run(cmd, db, account):
 
     # 心跳 sync_account 放在消息同步成功之后、图片之前：失败的轮次不刷新心跳，
     # 图片慢也不拖后心跳。它只有一行数据，不进 24 小时节流。
+    if cmd == "profiles":
+        from wechatauto.contact_profiles import collect_contact_profiles
+        payload = collect_contact_profiles(db)
+        if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > 32 * 1024 * 1024:
+            raise RuntimeError("朋友资料超过 32 MiB，请求未发送")
+        print("朋友资料同步:", sync_post("/contact-profiles", payload))
+        return
     if cmd == "init":
         sync_entities(db, account)
         _, by_chat, newest = sync_messages(db, account, incremental=False)
@@ -1155,7 +1163,7 @@ def main():
             raise SystemExit("--account 后面要跟 wxid 或账号目录名")
         del argv[i:i + 2]
     cmd = argv[0] if argv else "incremental"
-    if cmd not in ("init", "incremental", "entities", "messages", "media", "sweep"):
+    if cmd not in ("init", "incremental", "entities", "messages", "media", "sweep", "profiles"):
         raise SystemExit(__doc__)
 
     status, body = _retry("GET", SYNC_BASE + HEALTH_PATH, None,
